@@ -193,7 +193,7 @@
               <button onclick="selectEditZone('safeZone')" id="editGreenZone" class="px-2 py-1 rounded bg-gray-800 text-emerald-300 text-[11px]">綠色區域</button>
               <button onclick="closeFenceSettings()" id="btnCloseSettings" class="px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 text-gray-100 text-[11px] border border-gray-500"><i class="fa-solid fa-xmark"></i> 關閉設定</button>
             </div>
-            <div class="text-[11px] text-indigo-200">先選顏色，再逐點點選畫面；按完成後固定成封閉區域。也可拖曳圓點微調。</div>
+            <div id="editTipText" class="text-[11px] text-indigo-200">先選顏色，再逐點點選畫面；至少 3 點後點回第 1 點即可閉合。閉合後可拖曳圓點微調。</div>
           </div>
         </div>
 
@@ -233,6 +233,9 @@
             <button onclick="clearSelectedFenceZones()" id="btnClearAllZones" class="text-xs px-2.5 py-1 bg-red-950/70 hover:bg-red-900 text-red-300 rounded border border-red-800 transition">
               <i class="fa-solid fa-eraser"></i> 清除區域
             </button>
+            <a href="https://docs.google.com/spreadsheets/d/19vGOlRS7xNfncFF3Nt3XYcYKHjVdbAHIaba1RWG1gVw/edit?gid=906012309#gid=906012309" target="_blank" rel="noopener noreferrer" id="btnOpenSheet" class="text-xs px-2.5 py-1 bg-cyan-950/70 hover:bg-cyan-900 text-cyan-300 rounded border border-cyan-800 transition inline-flex items-center gap-1" title="開啟 Google Sheet 資料庫">
+              <i class="fa-solid fa-table-list"></i> 開啟sheet資料庫
+            </a>
           </div>
         </div>
       </div>
@@ -614,26 +617,36 @@ function saveToDrive_(base64Image, timestamp) {
 function uploadToImgbb_(base64Image) {
   var key = PropertiesService.getScriptProperties().getProperty('IMGBB_API_KEY');
   if (!key) return { url: '', error: 'IMGBB_API_KEY missing' };
-  try {
-    var cleanBase64 = String(base64Image).split(',').pop();
-    var response = UrlFetchApp.fetch('https://api.imgbb.com/1/upload?key=' + encodeURIComponent(key), {
-      method: 'post',
-      contentType: 'application/x-www-form-urlencoded',
-      payload: { image: cleanBase64 },
-      muteHttpExceptions: true
-    });
-    var code = response.getResponseCode();
-    var body = response.getContentText();
-    console.log('ImgBB response ' + code + ': ' + body);
-    var result = JSON.parse(body);
-    if (!result.success) {
-      return { url: '', error: 'HTTP ' + code + ' ' + body.substring(0, 150) };
+  var cleanBase64 = String(base64Image).split(',').pop();
+  var lastError = '';
+  // 黃色警報通常由自動偵測觸發，若 ImgBB 短暫回應失敗，重試一次避免只有文字沒有圖片。
+  for (var attempt = 1; attempt <= 2; attempt++) {
+    try {
+      var response = UrlFetchApp.fetch('https://api.imgbb.com/1/upload?key=' + encodeURIComponent(key), {
+        method: 'post',
+        contentType: 'application/x-www-form-urlencoded',
+        payload: { image: cleanBase64 },
+        muteHttpExceptions: true
+      });
+      var code = response.getResponseCode();
+      var body = response.getContentText();
+      console.log('ImgBB response attempt ' + attempt + ' ' + code + ': ' + body);
+      var result = JSON.parse(body);
+      if (result.success && result.data) {
+        // LINE 必須收到可直接讀取的 HTTPS 圖片網址；url 是 ImgBB 的原始圖片 URL。
+        var directUrl = result.data.url || result.data.display_url || '';
+        if (/^https:\/\//i.test(directUrl)) return { url: directUrl, error: '' };
+        lastError = 'ImgBB returned no HTTPS image URL';
+      } else {
+        lastError = 'HTTP ' + code + ' ' + body.substring(0, 150);
+      }
+    } catch (error) {
+      lastError = String(error).substring(0, 150);
+      console.error('ImgBB attempt ' + attempt + ' error: ' + error);
     }
-    return { url: result.data.display_url || result.data.url || '', error: '' };
-  } catch (error) {
-    console.error('ImgBB error: ' + error);
-    return { url: '', error: String(error).substring(0, 150) };
+    if (attempt < 2) Utilities.sleep(500);
   }
+  return { url: '', error: lastError || 'ImgBB upload failed' };
 }
 
 function linePush_(messages, lineTarget) {
@@ -783,6 +796,8 @@ function testLine2() {
     let isGreenZoneEditMode = false;
     let selectedEditZone = 'tripwire';
     let activeDragPoint = null;
+    // 自訂繪製是否已點回第 1 點完成閉合
+    let fenceClosed = { tripwire: true, proximity: true, safeZone: true };
 
     // 圍籬相對座標百分比 (可供使用者隨鏡頭視角拖曳調整)
     const defaultFence = {
@@ -819,6 +834,7 @@ function testLine2() {
     function resetFencePoints() {
       fencePoints = JSON.parse(JSON.stringify(defaultFence));
       crosswalkPoints = JSON.parse(JSON.stringify(defaultCrosswalk));
+      fenceClosed = { tripwire: true, proximity: true, safeZone: true };
       drawOverlay();
     }
 
@@ -828,6 +844,9 @@ function testLine2() {
       if (selected === 'all' || selected === 'tripwire') fencePoints.tripwire = [];
       if (selected === 'all' || selected === 'proximity') fencePoints.proximityZone = [];
       if (selected === 'all' || selected === 'safeZone') fencePoints.safeZone = [];
+      if (selected === 'all' || selected === 'tripwire') fenceClosed.tripwire = false;
+      if (selected === 'all' || selected === 'proximity') fenceClosed.proximityZone = false;
+      if (selected === 'all' || selected === 'safeZone') fenceClosed.safeZone = false;
       activeDragPoint = null;
       currentScenario = 'SAFE';
       setScenario('SAFE');
@@ -1041,6 +1060,17 @@ function testLine2() {
       drawOverlay();
     }
 
+    // 清除紅線、黃區、綠區（不改動下拉選單與其他設定）
+    function clearFenceZonesForRedraw() {
+      fencePoints.tripwire = [];
+      fencePoints.proximityZone = [];
+      fencePoints.safeZone = [];
+      fenceClosed = { tripwire: false, proximity: false, safeZone: false };
+      activeDragPoint = null;
+      currentScenario = 'SAFE';
+      setScenario('SAFE');
+    }
+
     // 自訂劃設圍籬切換
     function toggleEditFence() {
       if (!isEditMode && isGreenZoneEditMode) toggleGreenZoneEdit();
@@ -1053,7 +1083,14 @@ function testLine2() {
       if (isEditMode) {
         btn.className = "px-2.5 py-1 rounded bg-amber-600 hover:bg-amber-500 text-white font-medium flex items-center gap-1 shadow-md transition ring-2 ring-amber-300";
         text.innerText = "完成圍籬設定";
-        tip.innerHTML = '<div class="font-bold flex items-center gap-1.5 mb-1 text-cyan-300"><i class="fa-solid fa-draw-polygon"></i> 自訂劃設圍籬模式</div><div class="flex gap-1.5 mb-2"><button onclick="selectEditZone(\'tripwire\')" id="editRedZone" class="px-2 py-1 rounded bg-red-600 text-white text-[11px]">紅色區域</button><button onclick="selectEditZone(\'proximity\')" id="editYellowZone" class="px-2 py-1 rounded bg-gray-800 text-yellow-300 text-[11px]">黃色區域</button><button onclick="selectEditZone(\'safeZone\')" id="editGreenZone" class="px-2 py-1 rounded bg-gray-800 text-emerald-300 text-[11px]">綠色區域</button><button onclick="closeFenceSettings()" id="btnCloseSettings" class="px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 text-gray-100 text-[11px] border border-gray-500"><i class="fa-solid fa-xmark"></i> 關閉設定</button></div><div class="text-[11px] text-indigo-200">先選顏色，再逐點點選畫面；按完成後固定成封閉區域。也可拖曳圓點微調。</div>';
+        // 進入自訂劃設時，自動清除紅、黃、綠全部區域，從空白重新繪製
+        // （斑馬線模式只調整斑馬線四個角，不清除）
+        if (!crosswalkMode) {
+          clearFenceZonesForRedraw();
+          selectedEditZone = 'tripwire';
+          logLine('text-amber-300', `> [${new Date().toTimeString().split(' ')[0]}] 已自動清除紅、黃、綠全部區域；請先選顏色，再逐點點選畫面`);
+        }
+        tip.innerHTML = '<div class="font-bold flex items-center gap-1.5 mb-1 text-cyan-300"><i class="fa-solid fa-draw-polygon"></i> 自訂劃設圍籬模式</div><div class="flex gap-1.5 mb-2"><button onclick="selectEditZone(\'tripwire\')" id="editRedZone" class="px-2 py-1 rounded bg-red-600 text-white text-[11px]">紅色區域</button><button onclick="selectEditZone(\'proximity\')" id="editYellowZone" class="px-2 py-1 rounded bg-gray-800 text-yellow-300 text-[11px]">黃色區域</button><button onclick="selectEditZone(\'safeZone\')" id="editGreenZone" class="px-2 py-1 rounded bg-gray-800 text-emerald-300 text-[11px]">綠色區域</button><button onclick="closeFenceSettings()" id="btnCloseSettings" class="px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 text-gray-100 text-[11px] border border-gray-500"><i class="fa-solid fa-xmark"></i> 關閉設定</button></div><div id="editTipText" class="text-[11px] text-indigo-200">先選顏色，再逐點點選畫面；至少 3 點後點回第 1 點即可閉合。閉合後可拖曳圓點微調。</div>';
         tip.classList.remove('hidden');
       } else {
         btn.className = "px-2.5 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-medium flex items-center gap-1 shadow-md transition";
@@ -1155,6 +1192,17 @@ function testLine2() {
       const points = selectedEditZone === 'tripwire' ? fencePoints.tripwire :
         selectedEditZone === 'proximity' ? fencePoints.proximityZone : fencePoints.safeZone;
       const pointType = selectedEditZone;
+
+      // 至少 3 點後，點擊醒目的第 1 點即可完成封閉區域
+      if (!fenceClosed[pointType] && points.length >= 3 &&
+        Math.hypot(points[0].x - mx, points[0].y - my) < 0.055) {
+        fenceClosed[pointType] = true;
+        activeDragPoint = null;
+        logLine('text-emerald-300', `> ${pointType === 'tripwire' ? '紅色' : pointType === 'proximity' ? '黃色' : '綠色'}區域已閉合（已連結回第 1 點）`);
+        drawOverlay();
+        return;
+      }
+
       // 檢查目前選取區域的頂點
       for (let i = 0; i < points.length; i++) {
         const pt = points[i];
@@ -1164,7 +1212,10 @@ function testLine2() {
           return;
         }
       }
-      // 點擊空白處新增頂點，按完成後即固定為封閉區域
+      // 閉合後點擊空白處不再新增點，避免誤操作破壞已完成的區域
+      if (fenceClosed[pointType]) return;
+
+      // 點擊空白處新增第 1、2、3... 點
       points.push({ x: mx, y: my });
       drawOverlay();
     });
@@ -1213,7 +1264,7 @@ function testLine2() {
       const showProximity = document.getElementById('chkProximityZone').checked;
 
       // 綠色安全區：區域內安全，區域外為警報範圍
-      if (fencePoints.safeZone.length > 2) {
+      if (fencePoints.safeZone.length > 1) {
         ctx.save();
         ctx.beginPath();
         const s0 = fencePoints.safeZone[0];
@@ -1222,24 +1273,28 @@ function testLine2() {
           const s = fencePoints.safeZone[i];
           ctx.lineTo(s.x * w, s.y * h);
         }
-        ctx.closePath();
-        ctx.fillStyle = 'rgba(34, 197, 94, 0.18)';
-        ctx.fill();
+        if (fenceClosed.safeZone || !isEditMode) {
+          ctx.closePath();
+          ctx.fillStyle = 'rgba(34, 197, 94, 0.18)';
+          ctx.fill();
+        }
         ctx.strokeStyle = '#22c55e';
         ctx.lineWidth = 3;
         ctx.setLineDash([8, 5]);
         ctx.stroke();
         ctx.setLineDash([]);
-        ctx.fillStyle = '#4ade80';
-        ctx.font = 'bold 11px JetBrains Mono, sans-serif';
-        ctx.fillText('✓ 綠色安全區（區域外觸發警報）', s0.x * w + 10, s0.y * h + 20);
-        if (isGreenZoneEditMode) {
+        if (fenceClosed.safeZone || !isEditMode) {
+          ctx.fillStyle = '#4ade80';
+          ctx.font = 'bold 11px JetBrains Mono, sans-serif';
+          ctx.fillText('✓ 綠色安全區（區域外觸發警報）', s0.x * w + 10, s0.y * h + 20);
+        }
+        if (isGreenZoneEditMode || (isEditMode && selectedEditZone === 'safeZone')) {
           fencePoints.safeZone.forEach((pt) => {
             ctx.beginPath();
             ctx.arc(pt.x * w, pt.y * h, 8, 0, Math.PI * 2);
-            ctx.fillStyle = '#22c55e';
+            ctx.fillStyle = (fenceClosed.safeZone && pt === fencePoints.safeZone[0]) ? '#fff' : '#22c55e';
             ctx.fill();
-            ctx.strokeStyle = '#fff';
+            ctx.strokeStyle = '#166534';
             ctx.lineWidth = 2;
             ctx.stroke();
           });
@@ -1248,7 +1303,7 @@ function testLine2() {
       }
 
       // 1. 警戒黃區 (靠近圍牆防護區域 Polygon)
-      if (showProximity && fencePoints.proximityZone.length > 2) {
+      if (showProximity && fencePoints.proximityZone.length > 1) {
         ctx.save();
         ctx.beginPath();
         const p0 = fencePoints.proximityZone[0];
@@ -1257,10 +1312,12 @@ function testLine2() {
           const p = fencePoints.proximityZone[i];
           ctx.lineTo(p.x * w, p.y * h);
         }
-        ctx.closePath();
+        if (fenceClosed.proximityZone || !isEditMode) ctx.closePath();
 
-        ctx.fillStyle = currentScenario === 'PROXIMITY' ? 'rgba(234, 179, 8, 0.32)' : 'rgba(234, 179, 8, 0.14)';
-        ctx.fill();
+        if (fenceClosed.proximityZone || !isEditMode) {
+          ctx.fillStyle = currentScenario === 'PROXIMITY' ? 'rgba(234, 179, 8, 0.32)' : 'rgba(234, 179, 8, 0.14)';
+          ctx.fill();
+        }
 
         ctx.strokeStyle = '#eab308';
         ctx.lineWidth = 2.5;
@@ -1277,7 +1334,7 @@ function testLine2() {
           fencePoints.proximityZone.forEach((pt) => {
             ctx.beginPath();
             ctx.arc(pt.x * w, pt.y * h, 7, 0, Math.PI * 2);
-            ctx.fillStyle = '#facc15';
+            ctx.fillStyle = (fenceClosed.proximityZone && pt === fencePoints.proximityZone[0]) ? '#fff' : '#facc15';
             ctx.fill();
             ctx.strokeStyle = '#000';
             ctx.lineWidth = 2;
@@ -1297,7 +1354,7 @@ function testLine2() {
           const t = fencePoints.tripwire[i];
           ctx.lineTo(t.x * w, t.y * h);
         }
-        if (fencePoints.tripwire.length > 2) {
+        if (fencePoints.tripwire.length > 2 && (fenceClosed.tripwire || !isEditMode)) {
           ctx.closePath();
           ctx.fillStyle = currentScenario === 'CLIMBING' ? 'rgba(239, 68, 68, 0.24)' : 'rgba(239, 68, 68, 0.10)';
           ctx.fill();
@@ -1320,7 +1377,7 @@ function testLine2() {
           fencePoints.tripwire.forEach((pt) => {
             ctx.beginPath();
             ctx.arc(pt.x * w, pt.y * h, 8, 0, Math.PI * 2);
-            ctx.fillStyle = '#ef4444';
+            ctx.fillStyle = (fenceClosed.tripwire && pt === fencePoints.tripwire[0]) ? '#fff' : '#ef4444';
             ctx.fill();
             ctx.strokeStyle = '#fff';
             ctx.lineWidth = 2;
